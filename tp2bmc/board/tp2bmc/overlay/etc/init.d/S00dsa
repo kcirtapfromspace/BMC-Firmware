@@ -1,8 +1,28 @@
 #!/bin/sh
 
 OVERLAY_INTERFACES="/mnt/overlay/upper/etc/network/interfaces"
-BR0_PORTS="node1 node2 node3 node4 ge0 ge1"
+# Updated for link aggregation: bond0 replaces ge0 ge1
+BR0_PORTS="node1 node2 node3 node4 bond0"
+BR0_PORTS_LEGACY="node1 node2 node3 node4 ge0 ge1"
 DISABLE_MIGRATION_PATH="/mnt/overlay/upper/root/.disable_interface_migration"
+
+#
+# setup_bonding
+#
+# Loads the bonding kernel module and creates the bond0 interface
+# This must run before network interfaces are brought up
+#
+setup_bonding() {
+    # Load bonding module if not already loaded
+    if ! grep -q "^bonding " /proc/modules 2>/dev/null; then
+        modprobe bonding mode=balance-alb miimon=100 2>/dev/null || {
+            echo "Warning: Failed to load bonding module"
+            return 1
+        }
+        echo "Loaded bonding kernel module"
+    fi
+    return 0
+}
 
 #
 # migrate_overlay_interfaces_to_v2_1
@@ -45,10 +65,10 @@ migrate_overlay_interfaces_to_v2_1() {
         # Using awk to check if bridge-ports exists only within the br0 interface block
         bridge_ports_exist=$(
             awk '
-                BEGIN { found=0 } 
-                /^iface br0/ { p=1; next } 
-                /^iface/ { p=0 } 
-                p { if ($0 ~ /^[[:space:]]*bridge-ports/) found=1 } 
+                BEGIN { found=0 }
+                /^iface br0/ { p=1; next }
+                /^iface/ { p=0 }
+                p { if ($0 ~ /^[[:space:]]*bridge-ports/) found=1 }
                 END { print found }
             ' "$OVERLAY_INTERFACES"
         )
@@ -68,7 +88,7 @@ migrate_overlay_interfaces_to_v2_1() {
 
         # Find all eth0 interfaces (main and aliases)
         eth_interfaces=$(grep -E "^(auto|iface) *eth0(:?[0-9]*) " "$OVERLAY_INTERFACES" 2>/dev/null | awk '{print $2}' | sort -u)
-        
+
         # Collect interfaces that are about to be migrated
         for iface in $eth_interfaces; do
             new_iface=$(echo "$iface" | sed 's/^eth0/br0/')
@@ -94,7 +114,7 @@ migrate_overlay_interfaces_to_v2_1() {
     if [ $eth0_aliases_exist -eq 1 ]; then
         # Find all eth0:X interfaces
         eth_aliases=$(grep -E "^(auto|iface) *eth0:[0-9]+" "$OVERLAY_INTERFACES" 2>/dev/null | awk '{print $2}' | sort -u)
-        
+
         # Collect interfaces that are about to be migrated
         for alias in $eth_aliases; do
             new_alias=$(echo "$alias" | sed 's/^eth0:/br0:/')
@@ -115,6 +135,7 @@ migrate_overlay_interfaces_to_v2_1() {
     # and if bridge-ports are missing under br0, add it if necessary
     if [ $br0_exists -eq 1 ] && [ $bridge_ports_exist -eq 0 ]; then
         # If br0 exists but no bridge-ports, add the bridge-ports line under br0
+        # Use the new bonding-aware port list
         sed -i '/^iface br0 /a\  bridge-ports '"$BR0_PORTS" "$OVERLAY_INTERFACES"
 
         # Set bridge_ports_added to 1 to indicate that we made changes
@@ -127,12 +148,12 @@ migrate_overlay_interfaces_to_v2_1() {
         # Build the header text in a variable
         header_text="# Configuration updated by migration script\n"
         header_text="${header_text}# Original file backed up at ${OVERLAY_INTERFACES}.old\n"
-        
+
         # Add all interface migrations
         if [ -n "$migrated_interfaces" ]; then
             header_text="${header_text}${migrated_interfaces}"
         fi
-        
+
         # Add bridge-ports comment only if we added bridge-ports configuration
         if [ $bridge_ports_added -eq 1 ]; then
             header_text="${header_text}# Added bridge ports to br0\n"
@@ -146,11 +167,39 @@ migrate_overlay_interfaces_to_v2_1() {
 
         # Changes made, save the original file as .old
         mv "${OVERLAY_INTERFACES}.tmp" "${OVERLAY_INTERFACES}.old"
-        
+
         echo "Migration completed"
     else
         # No changes made, just clean up
         rm "${OVERLAY_INTERFACES}.tmp"
+    fi
+}
+
+#
+# migrate_bridge_ports_to_bonding
+#
+# Migrates bridge-ports configuration from legacy (ge0 ge1) to bonding (bond0)
+# This handles upgrades from non-bonding firmware to bonding-enabled firmware
+#
+migrate_bridge_ports_to_bonding() {
+    # Ensure the file exists
+    if [ ! -f "$OVERLAY_INTERFACES" ]; then
+        return 0
+    fi
+
+    # Check if the migration is disabled
+    if [ -f "$DISABLE_MIGRATION_PATH" ]; then
+        return 0
+    fi
+
+    # Check if bridge-ports contains ge0 or ge1 directly (legacy config)
+    if grep -q "bridge-ports.*ge[01]" "$OVERLAY_INTERFACES" 2>/dev/null; then
+        # Check if bond0 interface is already configured
+        if ! grep -q "^auto bond0\|^iface bond0" "$OVERLAY_INTERFACES" 2>/dev/null; then
+            echo "Note: Legacy bridge-ports detected with ge0/ge1"
+            echo "To enable link aggregation, update /etc/network/interfaces"
+            echo "or reflash with bonding-enabled firmware"
+        fi
     fi
 }
 
@@ -161,8 +210,14 @@ case "$1" in
         # Ethernet interface
         ip link set eth0 name dsa
 
+        # Set up bonding kernel module early
+        setup_bonding
+
         # Perform migration of interfaces
         migrate_overlay_interfaces_to_v2_1
+
+        # Check for legacy bridge-ports and advise on bonding
+        migrate_bridge_ports_to_bonding
         ;;
     *)
         echo "Usage: $0 {start}"
