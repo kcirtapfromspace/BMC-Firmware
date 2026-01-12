@@ -1,1 +1,0 @@
-import{j as r}from"./index-SIcQLDUw.js";function a({term:t,children:e}){return r.jsxs("div",{className:"flex flex-row border-b border-neutral-200 py-3 first:pt-0 last:border-none dark:border-neutral-700",children:[r.jsx("dt",{className:"w-1/2 font-semibold lg:w-1/4",children:t}),e&&r.jsx("dd",{className:"w-1/2 text-right lg:w-3/4 lg:text-start",children:e})]})}export{a as T};
