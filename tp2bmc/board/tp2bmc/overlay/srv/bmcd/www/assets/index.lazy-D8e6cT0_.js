@@ -1,0 +1,1 @@
+import{c as s,u as a,a as n,r as i,j as o}from"./index-SIcQLDUw.js";const c=s("/")({component:r});function r(){const{isAuthenticated:e}=a(),t=n();return i.useEffect(()=>{t(e?{to:"/info"}:{to:"/login"})},[e,t]),o.jsx(o.Fragment,{})}export{c as Route};

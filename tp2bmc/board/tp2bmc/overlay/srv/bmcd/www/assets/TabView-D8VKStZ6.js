@@ -1,0 +1,1 @@
+import{j as s}from"./index-SIcQLDUw.js";function o({title:e,children:a}){return s.jsxs("section",{children:[e&&s.jsx("h2",{className:"mb-8 text-lg font-bold",children:e}),s.jsx("div",{className:"space-y-8",children:a})]})}export{o as T};
