@@ -15,7 +15,7 @@ DISABLE_MIGRATION_PATH="/mnt/overlay/upper/root/.disable_interface_migration"
 setup_bonding() {
     # Load bonding module if not already loaded
     if ! grep -q "^bonding " /proc/modules 2>/dev/null; then
-        modprobe bonding mode=balance-alb miimon=100 2>/dev/null || {
+        modprobe bonding 2>/dev/null || {
             echo "Warning: Failed to load bonding module"
             return 1
         }

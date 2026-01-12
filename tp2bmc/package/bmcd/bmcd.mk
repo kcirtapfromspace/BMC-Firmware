@@ -11,6 +11,12 @@ BMCD_DEPENDENCIES += libopenssl
 BMCD_CARGO_ENV := PKG_CONFIG_ALLOW_CROSS=1
 BMCD_CARGO_ENV += CC_armv7_unknown_linux_gnueabi="arm-linux-gcc"
 
+# Add network configuration support (bonding) to bmcd
+define BMCD_ADD_NETWORK_CONFIG
+	python3 $(BR2_EXTERNAL_TP2BMC_PATH)/package/bmcd/add_network_config.py $(BMCD_SRCDIR)
+endef
+BMCD_POST_EXTRACT_HOOKS += BMCD_ADD_NETWORK_CONFIG
+
 # A copy of default build commands but with --path amended, since we have a virtual manifest.
 define BMCD_INSTALL_TARGET_CMDS
 	cd $(BMCD_SRCDIR) && \
