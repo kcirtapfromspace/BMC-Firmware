@@ -1,0 +1,176 @@
+#!/bin/sh
+#
+# S46netwatch - Network watchdog for automatic configuration revert
+#
+# This script monitors for pending network changes and automatically reverts
+# them if connectivity appears to be lost. Designed to prevent network lockout
+# when making configuration changes via the web UI or API.
+#
+# ============================================================================
+# USAGE
+# ============================================================================
+#
+# The watchdog works with a "pending changes" marker file:
+#
+# 1. API/UI creates /etc/netwatch.pending before applying network changes
+# 2. S46netwatch checks if this file is older than 60 seconds at boot
+# 3. If old pending file found, assume change failed -> revert to backup
+# 4. API/UI should delete /etc/netwatch.pending after confirming success
+#
+# This ensures: if the board reboots (or watchdog kicks in) and the pending
+# file is still there after 60s, the change clearly didn't work.
+#
+# ============================================================================
+# FILES
+# ============================================================================
+#
+# /etc/netwatch.pending        - Marker file created before network changes
+# /etc/network/interfaces.backup - Backup of working interfaces config
+# /etc/bonding.enabled         - Bonding marker (removed on revert)
+#
+# ============================================================================
+
+PENDING_FILE="/etc/netwatch.pending"
+INTERFACES_BACKUP="/etc/network/interfaces.backup"
+INTERFACES_FILE="/etc/network/interfaces"
+BONDING_ENABLED="/etc/bonding.enabled"
+REVERT_TIMEOUT=60
+
+# Log to syslog with script name tag
+log_info() {
+    logger -t S46netwatch -p user.info "$1"
+    echo "$1"
+}
+
+log_warning() {
+    logger -t S46netwatch -p user.warning "$1"
+    echo "Warning: $1" >&2
+}
+
+log_error() {
+    logger -t S46netwatch -p user.err "$1"
+    echo "Error: $1" >&2
+}
+
+# Check if a file is older than specified seconds
+file_is_older_than() {
+    file="$1"
+    seconds="$2"
+
+    if [ ! -f "$file" ]; then
+        return 1
+    fi
+
+    # Get file modification time (seconds since epoch)
+    file_mtime=$(stat -c %Y "$file" 2>/dev/null)
+    if [ -z "$file_mtime" ]; then
+        # Fallback for busybox stat
+        file_mtime=$(stat "$file" 2>/dev/null | grep -i modify | sed 's/.*: //')
+        if [ -n "$file_mtime" ]; then
+            file_mtime=$(date -d "$file_mtime" +%s 2>/dev/null)
+        fi
+    fi
+
+    if [ -z "$file_mtime" ]; then
+        log_warning "Could not determine age of $file"
+        return 1
+    fi
+
+    current_time=$(date +%s)
+    age=$((current_time - file_mtime))
+
+    [ "$age" -ge "$seconds" ]
+}
+
+# Perform network configuration revert
+do_revert() {
+    log_warning "Performing network configuration revert!"
+
+    # Step 1: Restore interfaces backup if available
+    if [ -f "$INTERFACES_BACKUP" ]; then
+        log_info "Restoring $INTERFACES_FILE from backup"
+        cp "$INTERFACES_BACKUP" "$INTERFACES_FILE"
+    else
+        log_warning "No backup file found at $INTERFACES_BACKUP"
+    fi
+
+    # Step 2: Remove bonding enabled marker
+    if [ -f "$BONDING_ENABLED" ]; then
+        log_info "Removing $BONDING_ENABLED"
+        rm -f "$BONDING_ENABLED"
+    fi
+
+    # Step 3: Remove pending marker
+    if [ -f "$PENDING_FILE" ]; then
+        log_info "Removing $PENDING_FILE"
+        rm -f "$PENDING_FILE"
+    fi
+
+    # Step 4: Restart networking
+    log_info "Restarting network via S40network"
+    if [ -x /etc/init.d/S40network ]; then
+        /etc/init.d/S40network restart
+    else
+        log_error "/etc/init.d/S40network not found or not executable"
+        return 1
+    fi
+
+    log_info "Network revert completed"
+}
+
+start_netwatch() {
+    log_info "Checking for pending network changes..."
+
+    # Check if pending file exists
+    if [ ! -f "$PENDING_FILE" ]; then
+        log_info "No pending changes found"
+        return 0
+    fi
+
+    # Check if pending file is older than timeout
+    if file_is_older_than "$PENDING_FILE" "$REVERT_TIMEOUT"; then
+        log_warning "Pending file is older than ${REVERT_TIMEOUT}s - network change may have failed"
+        do_revert
+    else
+        log_info "Pending file found but not yet timed out"
+    fi
+}
+
+stop_netwatch() {
+    # Nothing to stop - this is a one-shot check at boot
+    log_info "Netwatch stopped"
+}
+
+case "$1" in
+    start)
+        start_netwatch
+        ;;
+    stop)
+        stop_netwatch
+        ;;
+    restart)
+        stop_netwatch
+        start_netwatch
+        ;;
+    revert)
+        # Manual revert command for recovery purposes
+        do_revert
+        ;;
+    status)
+        if [ -f "$PENDING_FILE" ]; then
+            echo "Pending changes file exists: $PENDING_FILE"
+            ls -l "$PENDING_FILE"
+        else
+            echo "No pending changes"
+        fi
+        if [ -f "$INTERFACES_BACKUP" ]; then
+            echo "Backup file exists: $INTERFACES_BACKUP"
+        else
+            echo "No backup file"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|revert|status}"
+        exit 1
+        ;;
+esac
