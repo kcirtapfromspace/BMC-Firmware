@@ -1,1 +1,4 @@
 rockusb
+# Bonding kernel module for network link aggregation
+# Used by S45bonding when /etc/bonding.enabled exists
+bonding

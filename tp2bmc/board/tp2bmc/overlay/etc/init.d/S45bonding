@@ -1,0 +1,219 @@
+#!/bin/sh
+#
+# S45bonding - Configure network bonding for link aggregation
+#
+# This script sets up bond0 with the mode specified in /etc/bonding.conf
+# Runs after S40network to properly reconfigure the network with bonding
+#
+# ============================================================================
+# ROOT CAUSE ANALYSIS - Network Failure (US-001)
+# ============================================================================
+#
+# This script was created to fix the timing issues identified in the root
+# cause analysis. Key design decisions:
+#
+# 1. RUNS AFTER S40NETWORK (S45 > S40)
+#    - S40network brings up interfaces per /etc/network/interfaces
+#    - We then reconfigure for bonding if enabled
+#    - This ensures ge0/ge1 exist and are initialized
+#
+# 2. CHECKS BONDING_ENABLED MARKER FILE
+#    - Only proceeds if /etc/bonding.enabled exists
+#    - Safe default: if file missing, bonding is OFF
+#    - Prevents accidental lockout from misconfiguration
+#
+# 3. SETS UNIQUE MAC ON GE1
+#    - DSA ports share MAC by default (root cause #3)
+#    - We set ge1 = base_mac + 1 before enslaving
+#    - Prevents MAC flapping and ARP issues
+#
+# 4. HANDLES BRIDGE PORT SWAP
+#    - Removes ge0/ge1 from br0
+#    - Creates bond0, enslaves ge0/ge1
+#    - Adds bond0 to br0
+#    - Graceful fallback if something fails
+#
+# ============================================================================
+#
+# Supported modes:
+#   active-backup - Failover only (default, works with any setup)
+#   balance-alb   - Adaptive load balancing (no switch config needed)
+#   802.3ad       - LACP (requires switch LACP support for true 2Gbps)
+#   balance-rr    - Round-robin (requires switch support)
+#   balance-xor   - XOR (requires switch support)
+#   balance-tlb   - Transmit load balancing
+#
+
+BONDING_CONF="/etc/bonding.conf"
+BONDING_ENABLED="/etc/bonding.enabled"
+
+# Read bonding mode from config file, default to active-backup
+get_bonding_mode() {
+    if [ -f "$BONDING_CONF" ]; then
+        mode=$(head -1 "$BONDING_CONF" 2>/dev/null | tr -d '[:space:]')
+        # Validate mode is one of the allowed values
+        case "$mode" in
+            balance-rr|active-backup|balance-xor|broadcast|802.3ad|balance-tlb|balance-alb)
+                echo "$mode"
+                return 0
+                ;;
+            *)
+                # Invalid mode, log warning and use default
+                logger -t S45bonding -p user.warning "Invalid bonding mode '$mode' in $BONDING_CONF, using active-backup"
+                echo "active-backup"
+                return 0
+                ;;
+        esac
+    else
+        echo "active-backup"
+    fi
+}
+
+# Check if bonding is enabled
+is_bonding_enabled() {
+    [ -f "$BONDING_ENABLED" ]
+}
+
+# Log to syslog with script name tag
+log_info() {
+    logger -t S45bonding -p user.info "$1"
+    echo "$1"
+}
+
+log_warning() {
+    logger -t S45bonding -p user.warning "$1"
+    echo "Warning: $1" >&2
+}
+
+log_error() {
+    logger -t S45bonding -p user.err "$1"
+    echo "Error: $1" >&2
+}
+
+start_bonding() {
+    if ! is_bonding_enabled; then
+        log_info "Bonding not enabled (create $BONDING_ENABLED to enable)"
+        return 0
+    fi
+
+    MODE=$(get_bonding_mode)
+    log_info "Setting up bonding with mode: $MODE"
+
+    # Give network time to initialize after S40network
+    sleep 2
+
+    # Remove ge0 and ge1 from bridge (they were added by S40network)
+    # ROOT CAUSE FIX: This is the bridge port swap - remove individual NICs
+    ip link set ge0 nomaster 2>/dev/null
+    ip link set ge1 nomaster 2>/dev/null
+
+    # Bring interfaces down for reconfiguration
+    ip link set ge0 down 2>/dev/null
+    ip link set ge1 down 2>/dev/null
+
+    # ROOT CAUSE FIX #3: Set unique MAC on ge1
+    # DSA ports share the same MAC by default, which breaks bonding.
+    # Use base MAC + 1 for ge1 to ensure uniqueness.
+    BASE_MAC=$(cat /sys/class/net/ge0/address 2>/dev/null)
+    if [ -n "$BASE_MAC" ]; then
+        # Increment last byte of MAC address
+        GE1_MAC=$(echo "$BASE_MAC" | awk -F: '{
+            last = ("0x" $6) + 1;
+            printf "%s:%s:%s:%s:%s:%02x", $1, $2, $3, $4, $5, last
+        }')
+        ip link set ge1 address "$GE1_MAC" 2>/dev/null
+        log_info "Set ge1 MAC to $GE1_MAC (ge0 is $BASE_MAC)"
+    fi
+
+    # Delete existing bond0 if it exists (ensures correct mode on restart)
+    ip link del bond0 2>/dev/null
+
+    # Create bond0 with specified mode
+    if ! ip link add bond0 type bond mode "$MODE" miimon 100; then
+        log_error "Failed to create bond0 interface"
+        # Fallback: re-add ge0/ge1 to bridge
+        ip link set ge0 up 2>/dev/null
+        ip link set ge1 up 2>/dev/null
+        ip link set ge0 master br0 2>/dev/null
+        ip link set ge1 master br0 2>/dev/null
+        return 1
+    fi
+
+    # For 802.3ad, set LACP rate to fast for quicker failover
+    if [ "$MODE" = "802.3ad" ]; then
+        echo fast > /sys/class/net/bond0/bonding/lacp_rate 2>/dev/null
+    fi
+
+    # Enslave interfaces to bond
+    if ! ip link set ge0 master bond0; then
+        log_error "Failed to enslave ge0 to bond0"
+        ip link del bond0 2>/dev/null
+        ip link set ge0 up 2>/dev/null
+        ip link set ge1 up 2>/dev/null
+        ip link set ge0 master br0 2>/dev/null
+        ip link set ge1 master br0 2>/dev/null
+        return 1
+    fi
+
+    if ! ip link set ge1 master bond0; then
+        log_error "Failed to enslave ge1 to bond0"
+        ip link del bond0 2>/dev/null
+        ip link set ge0 up 2>/dev/null
+        ip link set ge1 up 2>/dev/null
+        ip link set ge0 master br0 2>/dev/null
+        ip link set ge1 master br0 2>/dev/null
+        return 1
+    fi
+
+    # Bring everything up
+    ip link set ge0 up
+    ip link set ge1 up
+    ip link set bond0 up
+
+    # Add bond0 to bridge
+    ip link set bond0 master br0
+
+    log_info "Bonding configured: mode=$MODE"
+
+    # Show status
+    if [ -f /proc/net/bonding/bond0 ]; then
+        grep -E "^(Bonding Mode|MII Status|Slave Interface)" /proc/net/bonding/bond0
+    fi
+}
+
+stop_bonding() {
+    log_info "Stopping bonding..."
+    ip link set bond0 nomaster 2>/dev/null
+    ip link del bond0 2>/dev/null
+
+    # Re-add ge0/ge1 to bridge directly
+    ip link set ge0 up 2>/dev/null
+    ip link set ge1 up 2>/dev/null
+    ip link set ge0 master br0 2>/dev/null
+    ip link set ge1 master br0 2>/dev/null
+}
+
+case "$1" in
+    start)
+        start_bonding
+        ;;
+    stop)
+        stop_bonding
+        ;;
+    restart)
+        stop_bonding
+        sleep 1
+        start_bonding
+        ;;
+    status)
+        if [ -f /proc/net/bonding/bond0 ]; then
+            cat /proc/net/bonding/bond0
+        else
+            echo "Bonding not active"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

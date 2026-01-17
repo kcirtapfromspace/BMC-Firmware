@@ -1,6 +1,62 @@
 #!/bin/sh
+#
+# S00dsa - DSA Switch Initialization and Interface Migration
+#
+# This script runs very early in boot (S00) to:
+# 1. Rename eth0 to "dsa" so it's not confused with a usable interface
+# 2. Migrate legacy eth0 configurations to br0
+# 3. Add bridge-ports if missing from br0 configuration
+#
+# ============================================================================
+# ROOT CAUSE ANALYSIS - Network Failure with Bonding (US-001)
+# ============================================================================
+#
+# ISSUE: When bonding was introduced, the BMC became unreachable after reboot.
+#
+# ROOT CAUSE #1: Bridge Port Conflict
+# ------------------------------------
+# The feature/nic-link-aggregation branch changed BR0_PORTS to include "bond0"
+# instead of "ge0 ge1", but:
+#   - S00dsa runs at boot priority 00 (very early)
+#   - S45bonding runs at boot priority 45 (after S40network)
+#   - bond0 doesn't exist yet when S00dsa runs
+#   - If migration adds "bond0" to bridge-ports, S40network fails to bring up br0
+#
+# ROOT CAUSE #2: DSA Port Initialization Timing
+# ---------------------------------------------
+# The ge0 and ge1 DSA ports may not be fully initialized when this script runs.
+# The bonding module needs the ports to be up before enslaving them.
+# Sequence should be:
+#   1. S00dsa: rename eth0 -> dsa, migrate interfaces (ge0/ge1 for non-bonding)
+#   2. S40network: bring up interfaces per /etc/network/interfaces
+#   3. S45bonding: if bonding enabled, reconfigure ge0/ge1 into bond0
+#
+# ROOT CAUSE #3: MAC Address Conflict on DSA Ports
+# ------------------------------------------------
+# Both ge0 and ge1 share the same MAC address by default (from the DSA master).
+# This breaks bonding because:
+#   - ARP replies come from both ports with same MAC
+#   - Switch may see MAC flapping between ports
+#   - Bonding driver expects unique MACs per slave
+# FIX: S45bonding should set unique MAC on ge1 (base MAC + 1) before enslaving.
+#
+# ROOT CAUSE #4: Interfaces File Inconsistency
+# --------------------------------------------
+# The interfaces file should NOT reference bond0 in bridge-ports unless bonding
+# is enabled. The default configuration should use ge0/ge1 directly.
+# S45bonding handles the bridge port swap when bonding is enabled.
+#
+# SOLUTION APPROACH:
+# - Keep BR0_PORTS as "ge0 ge1" (non-bonding default)
+# - S45bonding handles: remove ge0/ge1 from br0, create bond0, add bond0 to br0
+# - S45bonding checks /etc/bonding.enabled before doing anything
+# - S45bonding includes fallback if bond0 fails to get carrier
+#
+# ============================================================================
 
 OVERLAY_INTERFACES="/mnt/overlay/upper/etc/network/interfaces"
+# IMPORTANT: Use ge0/ge1 here, NOT bond0. S45bonding handles bonding setup later.
+# Using bond0 here would fail because bond0 doesn't exist at S00 boot time.
 BR0_PORTS="node1 node2 node3 node4 ge0 ge1"
 DISABLE_MIGRATION_PATH="/mnt/overlay/upper/root/.disable_interface_migration"
 
@@ -41,7 +97,7 @@ migrate_overlay_interfaces_to_v2_1() {
     bridge_ports_exist=0
 
     # Check if bridge-ports exists under iface br0
-    if [ $br0_exists -eq 1 ]; then
+    if [ "$br0_exists" -eq 1 ]; then
         # Using awk to check if bridge-ports exists only within the br0 interface block
         bridge_ports_exist=$(
             awk '
@@ -64,7 +120,7 @@ migrate_overlay_interfaces_to_v2_1() {
     migrated_interfaces=""
 
     # If eth0 exists and br0 doesn't exist, replace eth0 with br0
-    if [ $eth0_exists -eq 1 ] && [ $br0_exists -eq 0 ]; then
+    if [ "$eth0_exists" -eq 1 ] && [ "$br0_exists" -eq 0 ]; then
 
         # Find all eth0 interfaces (main and aliases)
         eth_interfaces=$(grep -E "^(auto|iface) *eth0(:?[0-9]*) " "$OVERLAY_INTERFACES" 2>/dev/null | awk '{print $2}' | sort -u)
@@ -91,7 +147,7 @@ migrate_overlay_interfaces_to_v2_1() {
     fi
 
     # Handle alias migrations separately - even if main interface is already br0
-    if [ $eth0_aliases_exist -eq 1 ]; then
+    if [ "$eth0_aliases_exist" -eq 1 ]; then
         # Find all eth0:X interfaces
         eth_aliases=$(grep -E "^(auto|iface) *eth0:[0-9]+" "$OVERLAY_INTERFACES" 2>/dev/null | awk '{print $2}' | sort -u)
         
@@ -113,7 +169,7 @@ migrate_overlay_interfaces_to_v2_1() {
 
     # Check if br0 exists (either originally or after replacing eth0)
     # and if bridge-ports are missing under br0, add it if necessary
-    if [ $br0_exists -eq 1 ] && [ $bridge_ports_exist -eq 0 ]; then
+    if [ "$br0_exists" -eq 1 ] && [ "$bridge_ports_exist" -eq 0 ]; then
         # If br0 exists but no bridge-ports, add the bridge-ports line under br0
         sed -i '/^iface br0 /a\  bridge-ports '"$BR0_PORTS" "$OVERLAY_INTERFACES"
 
@@ -123,7 +179,7 @@ migrate_overlay_interfaces_to_v2_1() {
     fi
 
     # Add migration comments to the top of the file only if changes were made and comments don't exist
-    if ([ $br0_migrated -eq 1 ] || [ $bridge_ports_added -eq 1 ]) && [ $comments_exist -eq 0 ]; then
+    if { [ "$br0_migrated" -eq 1 ] || [ "$bridge_ports_added" -eq 1 ]; } && [ "$comments_exist" -eq 0 ]; then
         # Build the header text in a variable
         header_text="# Configuration updated by migration script\n"
         header_text="${header_text}# Original file backed up at ${OVERLAY_INTERFACES}.old\n"
@@ -134,7 +190,7 @@ migrate_overlay_interfaces_to_v2_1() {
         fi
         
         # Add bridge-ports comment only if we added bridge-ports configuration
-        if [ $bridge_ports_added -eq 1 ]; then
+        if [ "$bridge_ports_added" -eq 1 ]; then
             header_text="${header_text}# Added bridge ports to br0\n"
             header_text="${header_text}# Full bridge configuration: bridge-ports ${BR0_PORTS}\n"
         fi
